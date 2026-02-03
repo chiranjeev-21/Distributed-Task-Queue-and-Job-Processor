@@ -3,7 +3,7 @@ import random
 import threading
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -18,41 +18,13 @@ from wsgiref.simple_server import make_server, WSGIRequestHandler, WSGIServer
 # -------------------------
 # Prometheus Metrics
 # -------------------------
-jobs_processed = Counter(
-    "worker_jobs_processed",
-    "Total jobs successfully processed by worker"
-)
-
-jobs_failed = Counter(
-    "worker_jobs_failed",
-    "Total jobs failed by worker"
-)
-
-jobs_picked = Counter(
-    "worker_jobs_picked",
-    "Total jobs picked for processing by worker"
-)
-
-jobs_retried = Counter(
-    "worker_jobs_retried",
-    "Total job retries by worker"
-)
-
-jobs_dlq = Counter(
-    "worker_jobs_dlq",
-    "Total jobs moved to DLQ by worker"
-)
-
-jobs_in_progress = Gauge(
-    "worker_jobs_in_progress",
-    "Jobs currently in progress by worker"
-)
-
-job_processing_seconds = Histogram(
-    "worker_job_processing_seconds",
-    "Job processing time in seconds"
-)
-
+jobs_processed = Counter("worker_jobs_processed", "Total jobs successfully processed")
+jobs_failed = Counter("worker_jobs_failed", "Total jobs failed")
+jobs_picked = Counter("worker_jobs_picked", "Total jobs picked")
+jobs_retried = Counter("worker_jobs_retried", "Total retries")
+jobs_dlq = Counter("worker_jobs_dlq", "Total jobs moved to DLQ")
+jobs_in_progress = Gauge("worker_jobs_in_progress", "Jobs in progress")
+job_processing_seconds = Histogram("worker_job_processing_seconds", "Processing time")
 job_status_transitions = Counter(
     "worker_job_status_transitions",
     "Job status transitions",
@@ -61,7 +33,7 @@ job_status_transitions = Counter(
 
 metrics_requests = Counter(
     "worker_metrics_requests",
-    "HTTP requests to worker metrics endpoint",
+    "HTTP requests to worker metrics",
     ["method", "path", "status"]
 )
 
@@ -78,48 +50,76 @@ LOG_METRICS_REQUESTS = os.getenv("METRICS_LOG_REQUESTS", "1") == "1"
 # Helpers
 # -------------------------
 def wait_for_db():
-    """Block until Postgres is reachable."""
     while True:
         try:
             db = SessionLocal()
             db.execute(text("SELECT 1"))
             db.close()
-            print(f"[{WORKER_NAME}] Worker connected to DB", flush=True)
+            print(f"[{WORKER_NAME}] Connected to DB", flush=True)
             break
         except OperationalError:
-            print(f"[{WORKER_NAME}] Worker waiting for DB...", flush=True)
+            print(f"[{WORKER_NAME}] Waiting for DB...", flush=True)
             time.sleep(2)
 
 
-def fetch_job(db):
+def record_transition(previous_status, next_status):
+    if previous_status and next_status and previous_status != next_status:
+        job_status_transitions.labels(
+            from_status=previous_status.value,
+            to_status=next_status.value,
+        ).inc()
+
+
+def fetch_and_lease_job(db):
+    """
+    Atomically:
+    - find pending job OR expired running job
+    - respect next_run_at
+    - claim lease
+    """
+
     result = db.execute(text("""
-        SELECT job_id FROM jobs
-        WHERE status = 'PENDING'
-        FOR UPDATE SKIP LOCKED
-        LIMIT 1
-    """)).fetchone()
+        UPDATE jobs
+        SET
+            status = 'RUNNING',
+            worker_id = :worker_id,
+            lease_until = :lease_until
+        WHERE job_id = (
+            SELECT job_id FROM jobs
+            WHERE
+                (
+                    status = 'PENDING'
+                    OR (status = 'RUNNING' AND lease_until < now())
+                )
+                AND (next_run_at IS NULL OR next_run_at <= now())
+            ORDER BY created_at
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING job_id
+    """), {
+        "worker_id": WORKER_NAME,
+        "lease_until": datetime.utcnow() + timedelta(seconds=LEASE_TIME)
+    }).fetchone()
 
     if not result:
         return None
 
     job_id = result[0]
     job = db.query(Job).filter(Job.job_id == job_id).first()
-    previous_status = job.status
-    job.status = JobStatus.RUNNING
-    db.commit()
-    record_transition(previous_status, job.status)
     return job
 
 
 def process(job):
-    """Simulated job processing."""
+    #changing from 2 to 60 for testing
     time.sleep(2)
-    if random.random() < 0.3:
-        raise Exception("Random failure")
+    raise Exception("always fail")
+    # if random.random() < 0.3:
+    #     raise Exception("Random failure")
 
 
 # -------------------------
-# Main worker loop
+# Metrics Server
 # -------------------------
 class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
@@ -128,8 +128,7 @@ class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
 class MetricsRequestHandler(WSGIRequestHandler):
     def log_message(self, format, *args):
         if LOG_METRICS_REQUESTS:
-            message = format % args
-            print(f"[{WORKER_NAME}] METRICS {message}", flush=True)
+            print(f"[{WORKER_NAME}] METRICS {format % args}", flush=True)
 
 
 def metrics_app_with_logging(app):
@@ -143,7 +142,6 @@ def metrics_app_with_logging(app):
             return start_response(status, headers, exc_info)
 
         return app(environ, _start_response)
-
     return _app
 
 
@@ -156,34 +154,23 @@ def start_metrics_server():
         server_class=ThreadedWSGIServer,
         handler_class=MetricsRequestHandler,
     ) as httpd:
-        print(
-            f"[{WORKER_NAME}] Worker metrics available at http://0.0.0.0:{METRICS_PORT}/metrics",
-            flush=True,
-        )
+        print(f"[{WORKER_NAME}] Metrics at /metrics", flush=True)
         httpd.serve_forever()
 
 
-def record_transition(previous_status, next_status):
-    if previous_status and next_status and previous_status != next_status:
-        job_status_transitions.labels(
-            from_status=previous_status.value,
-            to_status=next_status.value,
-        ).inc()
-
-
+# -------------------------
+# Main Worker Loop
+# -------------------------
 def main():
-    # Start metrics server
     threading.Thread(target=start_metrics_server, daemon=True).start()
-
-    # Wait for DB
     wait_for_db()
 
-    print(f"[{WORKER_NAME}] Worker started processing jobs", flush=True)
+    print(f"[{WORKER_NAME}] Worker started", flush=True)
 
     while True:
         db = SessionLocal()
         try:
-            job = fetch_job(db)
+            job = fetch_and_lease_job(db)
 
             if not job:
                 time.sleep(1)
@@ -191,50 +178,58 @@ def main():
 
             jobs_picked.inc()
             jobs_in_progress.inc()
-            print(
-                f"[{WORKER_NAME}] [{datetime.utcnow()}] Processing job {job.job_id}",
-                flush=True,
-            )
+            print(f"[{WORKER_NAME}] Processing job {job.job_id}", flush=True)
 
             try:
                 with job_processing_seconds.time():
                     process(job)
+
+                # Safe ACK
                 previous_status = job.status
-                job.status = JobStatus.DONE
-                jobs_processed.inc()
-                record_transition(previous_status, job.status)
-                print(
-                    f"[{WORKER_NAME}] [{datetime.utcnow()}] Job {job.job_id} DONE",
-                    flush=True,
-                )
+                updated = db.query(Job).filter(
+                    Job.job_id == job.job_id,
+                    Job.worker_id == WORKER_NAME
+                ).update({
+                    Job.status: JobStatus.DONE,
+                    Job.worker_id: None,
+                    Job.lease_until: None
+                })
+
+                if updated:
+                    jobs_processed.inc()
+                    record_transition(previous_status, JobStatus.DONE)
+                    print(f"[{WORKER_NAME}] Job {job.job_id} DONE", flush=True)
 
             except Exception:
-                job.retry_count += 1
                 jobs_failed.inc()
+                job.retry_count += 1
 
                 if job.retry_count >= job.max_retries:
                     previous_status = job.status
                     job.status = JobStatus.DLQ
+                    job.worker_id = None
+                    job.lease_until = None
                     jobs_dlq.inc()
-                    record_transition(previous_status, job.status)
-                    print(
-                        f"[{WORKER_NAME}] [{datetime.utcnow()}] Job {job.job_id} moved to DLQ",
-                        flush=True,
-                    )
+                    record_transition(previous_status, JobStatus.DLQ)
+                    print(f"[{WORKER_NAME}] Job {job.job_id} -> DLQ", flush=True)
+
                 else:
                     previous_status = job.status
+                    backoff = 2 ** job.retry_count
                     job.status = JobStatus.PENDING
+                    job.worker_id = None
+                    job.lease_until = None
+                    job.next_run_at = datetime.utcnow() + timedelta(seconds=backoff)
                     jobs_retried.inc()
-                    record_transition(previous_status, job.status)
+                    record_transition(previous_status, JobStatus.PENDING)
                     print(
-                        f"[{WORKER_NAME}] [{datetime.utcnow()}] Retrying job {job.job_id}",
-                        flush=True,
+                        f"[{WORKER_NAME}] Retrying job {job.job_id} in {backoff}s",
+                        flush=True
                     )
 
             finally:
                 jobs_in_progress.dec()
-
-            db.commit()
+                db.commit()
 
         finally:
             db.close()

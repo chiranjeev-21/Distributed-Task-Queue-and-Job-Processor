@@ -5,11 +5,10 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Enum
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Enum, Index
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.sql import func
-from sqlalchemy.pool import NullPool
-from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from prometheus_client import Counter, Gauge, generate_latest
 import os
@@ -21,7 +20,6 @@ engine = create_engine(
     pool_size=10,
     max_overflow=20,
 )
-
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -45,10 +43,19 @@ class Job(Base):
     retry_count = Column(Integer, default=0)
     max_retries = Column(Integer, default=3)
     lease_until = Column(DateTime, nullable=True)
-    idempotency_key = Column(String, nullable=True, index=True)
+    idempotency_key = Column(String, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
 
+
+# --- REAL idempotency guarantee (DB level) ---
+Index(
+    "uniq_user_idem_key",
+    Job.user_id,
+    Job.idempotency_key,
+    unique=True,
+    postgresql_where=Job.idempotency_key.isnot(None),
+)
 
 Base.metadata.create_all(bind=engine)
 
@@ -63,6 +70,7 @@ def get_db():
         db.close()
 
 
+# Prometheus metrics
 jobs_total = Counter("jobs_total", "Total jobs submitted")
 jobs_done = Counter("jobs_done", "Jobs completed")
 jobs_dlq = Counter("jobs_dlq", "Jobs moved to DLQ")
@@ -104,10 +112,12 @@ def submit_job(
     user_id: str,
     payload: str,
     idempotency_key: Optional[str] = None,
-    db = Depends(get_db)
+    db=Depends(get_db)
 ):
+    # Step 1: fast-path check (per user)
     if idempotency_key:
         existing = db.query(Job).filter(
+            Job.user_id == user_id,
             Job.idempotency_key == idempotency_key
         ).first()
         if existing:
@@ -125,9 +135,19 @@ def submit_job(
     )
 
     db.add(job)
-    db.commit()
-    db.refresh(job)
 
+    try:
+        db.commit()
+    except IntegrityError:
+        # Step 2: race-safe fallback
+        db.rollback()
+        existing = db.query(Job).filter(
+            Job.user_id == user_id,
+            Job.idempotency_key == idempotency_key
+        ).first()
+        return {"job_id": existing.job_id}
+
+    db.refresh(job)
     jobs_total.inc()
     print(f"JOB_SUBMITTED job_id={job.job_id}")
 

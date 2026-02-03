@@ -111,11 +111,9 @@ def fetch_and_lease_job(db):
 
 
 def process(job):
-    #changing from 2 to 60 for testing
     time.sleep(2)
-    raise Exception("always fail")
-    # if random.random() < 0.3:
-    #     raise Exception("Random failure")
+    if random.random() < 0.3:
+        raise Exception("Random failure")
 
 
 # -------------------------

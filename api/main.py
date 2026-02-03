@@ -14,8 +14,6 @@ from sqlalchemy import text
 from prometheus_client import Counter, Gauge, generate_latest
 import os
 
-print("API DB PATH:", os.path.abspath("jobs.db"))
-
 DATABASE_URL = "postgresql+psycopg2://jobuser:jobpass@postgres:5432/jobqueue"
 
 engine = create_engine(

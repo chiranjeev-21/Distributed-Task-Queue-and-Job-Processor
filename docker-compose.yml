@@ -29,22 +29,31 @@ services:
 
   worker:
     build: .
-    command: python worker/worker.py
+    command: python -u worker/worker.py
     environment:
       - ROLE=worker
+      - PYTHONUNBUFFERED=1
+      - METRICS_LOG_REQUESTS=1
+      - METRICS_PORT=8001
     depends_on:
       - postgres
       - api
 
   prometheus:
     image: prom/prometheus
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
+
+
 
   grafana:
     image: grafana/grafana
     ports:
       - "3000:3000"
+    volumes:
+      - ./observability/grafana:/etc/grafana/provisioning
 
 volumes:
   pgdata:

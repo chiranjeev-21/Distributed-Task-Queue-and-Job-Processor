@@ -1,0 +1,33 @@
+{
+  "title": "Job Queue Dashboard",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Jobs Submitted",
+      "targets": [
+        { "expr": "jobs_total" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Jobs Done",
+      "targets": [
+        { "expr": "jobs_done" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Jobs in DLQ",
+      "targets": [
+        { "expr": "jobs_dlq" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Worker Jobs Processed",
+      "targets": [
+        { "expr": "worker_jobs_processed_total" }
+      ]
+    }
+  ]
+}

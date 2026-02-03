@@ -3,7 +3,7 @@ import enum
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Enum
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -16,21 +16,13 @@ import os
 
 print("API DB PATH:", os.path.abspath("jobs.db"))
 
-DATABASE_URL = "sqlite:////app/data/jobs.db"
+DATABASE_URL = "postgresql+psycopg2://jobuser:jobpass@postgres:5432/jobqueue"
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={
-        "check_same_thread": False,
-        "timeout": 30
-    },
-    poolclass=NullPool
+    pool_size=10,
+    max_overflow=20,
 )
-
-
-with engine.connect() as conn:
-    conn.execute(text("PRAGMA journal_mode=WAL;"))
-    conn.execute(text("PRAGMA busy_timeout=30000;"))
 
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -68,7 +60,7 @@ app = FastAPI(title="Distributed Job Queue")
 def get_db():
     db = SessionLocal()
     try:
-        return db
+        yield db
     finally:
         db.close()
 
@@ -113,10 +105,9 @@ def health():
 def submit_job(
     user_id: str,
     payload: str,
-    idempotency_key: Optional[str] = None
+    idempotency_key: Optional[str] = None,
+    db = Depends(get_db)
 ):
-    db = get_db()
-
     if idempotency_key:
         existing = db.query(Job).filter(
             Job.idempotency_key == idempotency_key
@@ -146,8 +137,7 @@ def submit_job(
 
 
 @app.get("/jobs/{job_id}")
-def get_status(job_id: str):
-    db = get_db()
+def get_status(job_id: str, db=Depends(get_db)):
     job = db.query(Job).filter(Job.job_id == job_id).first()
 
     if not job:
@@ -161,8 +151,7 @@ def get_status(job_id: str):
 
 
 @app.get("/jobs")
-def list_jobs(status: Optional[JobStatus] = Query(None)):
-    db = get_db()
+def list_jobs(status: Optional[JobStatus] = Query(None), db=Depends(get_db)):
     query = db.query(Job)
     if status:
         query = query.filter(Job.status == status)

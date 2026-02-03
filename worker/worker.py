@@ -1,6 +1,10 @@
 import time
 import random
 from datetime import datetime, timedelta
+import sys
+import os
+from sqlalchemy.exc import OperationalError
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from api.main import SessionLocal, Job, JobStatus
 
@@ -9,36 +13,33 @@ from sqlalchemy import text
 LEASE_TIME = 30
 
 def fetch_job(db):
-    now = datetime.utcnow()
-    lease_until = now + timedelta(seconds=LEASE_TIME)
-
-    result = db.execute(
-        text("""
-        UPDATE jobs
-        SET status = :running,
-            lease_until = :lease_until
-        WHERE job_id = (
-            SELECT job_id FROM jobs
-            WHERE status = :pending
-            LIMIT 1
-        )
-        RETURNING job_id
-        """),
-        {
-            "pending": JobStatus.PENDING.value,
-            "running": JobStatus.RUNNING.value,
-            "lease_until": lease_until
-        }
-    ).fetchone()
+    result = db.execute(text("""
+        SELECT job_id FROM jobs
+        WHERE status = 'PENDING'
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)).fetchone()
 
     if not result:
         return None
 
-    db.commit()
-
     job_id = result[0]
-    return db.query(Job).filter(Job.job_id == job_id).first()
+    job = db.query(Job).filter(Job.job_id == job_id).first()
+    job.status = JobStatus.RUNNING
+    db.commit()
+    return job
 
+
+def wait_for_db():
+    while True:
+        try:
+            db = SessionLocal()
+            db.execute(text("SELECT 1"))
+            db.close()
+            break
+        except OperationalError:
+            print("Waiting for DB...")
+            time.sleep(2)
 
 
 def process(job):
@@ -48,6 +49,7 @@ def process(job):
 
 
 def main():
+    wait_for_db()
     while True:
         db = SessionLocal()
         try:

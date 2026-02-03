@@ -1,10 +1,11 @@
 FROM python:3.10-slim
 
 WORKDIR /app
-COPY . /app
 
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# makes /app importable
 ENV PYTHONPATH=/app
-
-RUN pip install fastapi uvicorn sqlalchemy aiosqlite prometheus-client opentelemetry-api opentelemetry-sdk
-
-EXPOSE 8000

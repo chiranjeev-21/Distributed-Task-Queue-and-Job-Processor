@@ -1,21 +1,40 @@
 version: "3.9"
 
 services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: jobuser
+      POSTGRES_PASSWORD: jobpass
+      POSTGRES_DB: jobqueue
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U jobuser -d jobqueue"]
+
+
+
   api:
     build: .
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - ROLE=api
     ports:
       - "8000:8000"
-    volumes:
-      - ./data:/app/data
 
   worker:
     build: .
     command: python worker/worker.py
+    environment:
+      - ROLE=worker
     depends_on:
+      - postgres
       - api
-    volumes:
-      - ./data:/app/data
 
   prometheus:
     image: prom/prometheus
@@ -26,3 +45,6 @@ services:
     image: grafana/grafana
     ports:
       - "3000:3000"
+
+volumes:
+  pgdata:

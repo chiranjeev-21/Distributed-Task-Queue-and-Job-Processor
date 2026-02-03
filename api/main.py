@@ -39,16 +39,24 @@ class Job(Base):
     job_id = Column(String, primary_key=True, index=True)
     user_id = Column(String, index=True)
     payload = Column(Text)
+
     status = Column(Enum(JobStatus), default=JobStatus.PENDING)
+
+    # --- distributed persistence fields ---
+    worker_id = Column(String, nullable=True)
+    lease_until = Column(DateTime, nullable=True)
+    next_run_at = Column(DateTime, nullable=True)
+
     retry_count = Column(Integer, default=0)
     max_retries = Column(Integer, default=3)
-    lease_until = Column(DateTime, nullable=True)
+
     idempotency_key = Column(String, nullable=True)
+
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, onupdate=func.now())
 
 
-# --- REAL idempotency guarantee (DB level) ---
+# Idempotency guarantee
 Index(
     "uniq_user_idem_key",
     Job.user_id,
@@ -114,7 +122,7 @@ def submit_job(
     idempotency_key: Optional[str] = None,
     db=Depends(get_db)
 ):
-    # Step 1: fast-path check (per user)
+    # Idempotency fast path
     if idempotency_key:
         existing = db.query(Job).filter(
             Job.user_id == user_id,
@@ -131,7 +139,8 @@ def submit_job(
         user_id=user_id,
         payload=payload,
         status=JobStatus.PENDING,
-        idempotency_key=idempotency_key
+        idempotency_key=idempotency_key,
+        next_run_at=datetime.utcnow()
     )
 
     db.add(job)
@@ -139,7 +148,6 @@ def submit_job(
     try:
         db.commit()
     except IntegrityError:
-        # Step 2: race-safe fallback
         db.rollback()
         existing = db.query(Job).filter(
             Job.user_id == user_id,
@@ -164,7 +172,10 @@ def get_status(job_id: str, db=Depends(get_db)):
     return {
         "job_id": job.job_id,
         "status": job.status,
-        "retry_count": job.retry_count
+        "retry_count": job.retry_count,
+        "worker_id": job.worker_id,
+        "lease_until": job.lease_until,
+        "next_run_at": job.next_run_at
     }
 
 

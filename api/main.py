@@ -11,8 +11,12 @@ from sqlalchemy.sql import func
 from sqlalchemy.exc import IntegrityError
 
 from prometheus_client import Counter, Gauge, generate_latest
+import redis
 import os
 
+# -------------------------
+# Database
+# -------------------------
 DATABASE_URL = "postgresql+psycopg2://jobuser:jobpass@postgres:5432/jobqueue"
 
 engine = create_engine(
@@ -24,7 +28,21 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# -------------------------
+# Redis (Rate Limiting)
+# -------------------------
+redis_client = redis.Redis(
+    host="redis",
+    port=6379,
+    decode_responses=True,
+)
 
+MAX_JOBS_PER_MINUTE = 10
+MAX_CONCURRENT_JOBS = 5
+
+# -------------------------
+# Models
+# -------------------------
 class JobStatus(str, enum.Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -42,7 +60,6 @@ class Job(Base):
 
     status = Column(Enum(JobStatus), default=JobStatus.PENDING)
 
-    # --- distributed persistence fields ---
     worker_id = Column(String, nullable=True)
     lease_until = Column(DateTime, nullable=True)
     next_run_at = Column(DateTime, nullable=True)
@@ -56,7 +73,6 @@ class Job(Base):
     updated_at = Column(DateTime, onupdate=func.now())
 
 
-# Idempotency guarantee
 Index(
     "uniq_user_idem_key",
     Job.user_id,
@@ -67,6 +83,9 @@ Index(
 
 Base.metadata.create_all(bind=engine)
 
+# -------------------------
+# App
+# -------------------------
 app = FastAPI(title="Distributed Job Queue")
 
 
@@ -78,38 +97,44 @@ def get_db():
         db.close()
 
 
-# Prometheus metrics
+# -------------------------
+# Metrics
+# -------------------------
 jobs_total = Counter("jobs_total", "Total jobs submitted")
-jobs_done = Counter("jobs_done", "Jobs completed")
-jobs_dlq = Counter("jobs_dlq", "Jobs moved to DLQ")
 jobs_running = Gauge("jobs_running", "Running jobs")
+jobs_dlq = Counter("jobs_dlq", "Jobs moved to DLQ")
 
 
-MAX_CONCURRENT_JOBS = 5
-MAX_JOBS_PER_MINUTE = 10
+# -------------------------
+# Rate Limiting (Redis)
+# -------------------------
+def enforce_rate_limit(user_id: str):
+    current_minute = datetime.utcnow().strftime("%Y%m%d%H%M")
+    key = f"rate:{user_id}:{current_minute}"
+
+    count = redis_client.incr(key)
+    redis_client.expire(key, 60)
+
+    if count > MAX_JOBS_PER_MINUTE:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 
-def enforce_concurrent_limit(db, user_id):
+# -------------------------
+# Concurrency Limit (Postgres)
+# -------------------------
+def enforce_concurrent_limit(db, user_id: str):
     count = db.query(Job).filter(
         Job.user_id == user_id,
         Job.status == JobStatus.RUNNING
     ).count()
 
     if count >= MAX_CONCURRENT_JOBS:
-        raise HTTPException(429, "Max concurrent jobs exceeded")
+        raise HTTPException(status_code=429, detail="Max concurrent jobs exceeded")
 
 
-def enforce_rate_limit(db, user_id):
-    one_minute_ago = datetime.utcnow() - timedelta(minutes=1)
-    count = db.query(Job).filter(
-        Job.user_id == user_id,
-        Job.created_at >= one_minute_ago
-    ).count()
-
-    if count >= MAX_JOBS_PER_MINUTE:
-        raise HTTPException(429, "Rate limit exceeded")
-
-
+# -------------------------
+# Routes
+# -------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -122,7 +147,10 @@ def submit_job(
     idempotency_key: Optional[str] = None,
     db=Depends(get_db)
 ):
-    # Idempotency fast path
+    # Redis rate limit (fast path)
+    enforce_rate_limit(user_id)
+
+    # Idempotency
     if idempotency_key:
         existing = db.query(Job).filter(
             Job.user_id == user_id,
@@ -131,7 +159,7 @@ def submit_job(
         if existing:
             return {"job_id": existing.job_id}
 
-    enforce_rate_limit(db, user_id)
+    # Strong consistency limit
     enforce_concurrent_limit(db, user_id)
 
     job = Job(
@@ -140,7 +168,7 @@ def submit_job(
         payload=payload,
         status=JobStatus.PENDING,
         idempotency_key=idempotency_key,
-        next_run_at=datetime.utcnow()
+        next_run_at=datetime.utcnow(),
     )
 
     db.add(job)
@@ -175,7 +203,7 @@ def get_status(job_id: str, db=Depends(get_db)):
         "retry_count": job.retry_count,
         "worker_id": job.worker_id,
         "lease_until": job.lease_until,
-        "next_run_at": job.next_run_at
+        "next_run_at": job.next_run_at,
     }
 
 

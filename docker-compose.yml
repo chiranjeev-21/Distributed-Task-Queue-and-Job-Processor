@@ -14,7 +14,11 @@ services:
     healthcheck:
         test: ["CMD-SHELL", "pg_isready -U jobuser -d jobqueue"]
 
-
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
 
   api:
     build: .
@@ -22,6 +26,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
     environment:
       - ROLE=api
     ports:
@@ -45,8 +51,6 @@ services:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
-
-
 
   grafana:
     image: grafana/grafana

@@ -23,8 +23,12 @@ jobs_failed = Counter("worker_jobs_failed", "Total jobs failed")
 jobs_picked = Counter("worker_jobs_picked", "Total jobs picked")
 jobs_retried = Counter("worker_jobs_retried", "Total retries")
 jobs_dlq = Counter("worker_jobs_dlq", "Total jobs moved to DLQ")
+
 jobs_in_progress = Gauge("worker_jobs_in_progress", "Jobs in progress")
+jobs_running = Gauge("jobs_running", "Number of jobs currently running")  # NEW
+
 job_processing_seconds = Histogram("worker_job_processing_seconds", "Processing time")
+
 job_status_transitions = Counter(
     "worker_job_status_transitions",
     "Job status transitions",
@@ -71,13 +75,6 @@ def record_transition(previous_status, next_status):
 
 
 def fetch_and_lease_job(db):
-    """
-    Atomically:
-    - find pending job OR expired running job
-    - respect next_run_at
-    - claim lease
-    """
-
     result = db.execute(text("""
         UPDATE jobs
         SET
@@ -174,15 +171,17 @@ def main():
                 time.sleep(1)
                 continue
 
+            # Job picked
             jobs_picked.inc()
             jobs_in_progress.inc()
+            jobs_running.inc()  # INCREMENT when job enters RUNNING
+
             print(f"[{WORKER_NAME}] Processing job {job.job_id}", flush=True)
 
             try:
                 with job_processing_seconds.time():
                     process(job)
 
-                # Safe ACK
                 previous_status = job.status
                 updated = db.query(Job).filter(
                     Job.job_id == job.job_id,
@@ -227,6 +226,7 @@ def main():
 
             finally:
                 jobs_in_progress.dec()
+                jobs_running.dec()  # DECREMENT when job leaves RUNNING
                 db.commit()
 
         finally:

@@ -57,7 +57,8 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./observability/grafana:/etc/grafana/provisioning
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+
 
 volumes:
   pgdata:

@@ -12,7 +12,7 @@
       "type": "stat",
       "title": "Jobs Done",
       "targets": [
-        { "expr": "jobs_done" }
+        { "expr": "worker_jobs_processed_total" }
       ]
     },
     {
@@ -27,6 +27,20 @@
       "title": "Worker Jobs Processed",
       "targets": [
         { "expr": "worker_jobs_processed_total" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Worker Jobs failed",
+      "targets": [
+        { "expr": "worker_jobs_failed_total" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Worker Jobs failed",
+      "targets": [
+        { "expr": "worker_jobs_in_progress" }
       ]
     }
   ]

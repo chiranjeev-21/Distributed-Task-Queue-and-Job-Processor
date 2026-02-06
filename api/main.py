@@ -101,9 +101,8 @@ def get_db():
 # Metrics
 # -------------------------
 jobs_total = Counter("jobs_total", "Total jobs submitted")
-jobs_running = Gauge("jobs_running", "Running jobs")
+# jobs_running = Gauge("jobs_running", "Running jobs")
 jobs_dlq = Counter("jobs_dlq", "Jobs moved to DLQ")
-
 
 # -------------------------
 # Rate Limiting (Redis)
